@@ -59,9 +59,11 @@ LINGUA_TO_NAME = {
     Language.CHINESE: "Chinese",
 }
 
-# Max number of strings sent to model.generate() in one batch.
-# Tune based on GPU memory - lower if you hit OOM, raise if you have headroom.
-BATCH_SIZE = 32
+# CPU-friendly inference settings. Smaller batches reduce peak RAM usage, while
+# two beams provide a reasonable translation quality/speed compromise.
+BATCH_SIZE = 8
+NUM_BEAMS = 2
+MAX_OUTPUT_LENGTH = 512
 # Simple in-memory cache: (text, source, target) -> translation.
 # Countries/static data barely change, so this avoids re-translating
 # the same strings on every request. Swap for Redis if you need it
@@ -175,9 +177,9 @@ def _translate_batch_uncached(
             forced_bos_token_id=tokenizer.convert_tokens_to_ids(
                 LANGUAGES[target]
             ),
-            num_beams=5,
+            num_beams=NUM_BEAMS,
             do_sample=False,
-            max_new_tokens=512,
+            max_length=MAX_OUTPUT_LENGTH,
             early_stopping=True,
         )
 
