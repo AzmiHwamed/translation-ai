@@ -1,7 +1,7 @@
 from typing import Any
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.services.translator import (
     translate_json_values,
@@ -21,7 +21,7 @@ class JsonTranslationRequest(BaseModel):
     data: Any
     target: str
     source: str | None = None
-    ignore_keys: list[str] = []
+    ignore_keys: list[str] = Field(default_factory=list)
 
 
 @router.post("/translate")

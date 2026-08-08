@@ -1,47 +1,26 @@
 import copy
+import os
 from typing import Any
 
-from lingua import Language, LanguageDetectorBuilder
-import torch
-
-_model = None
-_tokenizer = None
-_device = None
+import httpx
+from dotenv import load_dotenv
 
 
-def get_translation_model():
+load_dotenv()
 
-    global _model
-    global _tokenizer
-    global _device
+GOOGLE_TRANSLATE_URL = "https://translation.googleapis.com/language/translate/v2"
 
-    if _model is None:
-
-        from app.models.translator_model import (
-            model,
-            tokenizer,
-            device
-        )
-
-        _model = model
-        _tokenizer = tokenizer
-        _device = device
-
-    return _model, _tokenizer, _device
-
-
+# Google Cloud Translation uses ISO-style language codes.
 LANGUAGES = {
-    "English": "eng_Latn",
-    "French": "fra_Latn",
-    "Arabic": "arb_Arab",
-    "Japanese": "jpn_Jpan",
-    "German": "deu_Latn",
-    "Spanish": "spa_Latn",
-    "Chinese": "zho_Hans",
+    "English": "en",
+    "French": "fr",
+    "Arabic": "ar",
+    "Japanese": "ja",
+    "German": "de",
+    "Spanish": "es",
+    "Chinese": "zh-CN",
 }
 
-# Reviewed translations for short catalogue labels that lack enough context for
-# reliable machine translation. Keys are normalized by _glossary_translation.
 GLOSSARY: dict[tuple[str, str], dict[str, str]] = {
     ("English", "Arabic"): {
         "pet supplies": "مستلزمات الحيوانات الأليفة",
@@ -49,57 +28,165 @@ GLOSSARY: dict[tuple[str, str], dict[str, str]] = {
     },
 }
 
-LINGUA_TO_NAME = {
-    Language.ENGLISH: "English",
-    Language.FRENCH: "French",
-    Language.ARABIC: "Arabic",
-    Language.JAPANESE: "Japanese",
-    Language.GERMAN: "German",
-    Language.SPANISH: "Spanish",
-    Language.CHINESE: "Chinese",
-}
+# The API allows multiple strings in one request. Keeping batches below 30K
+# characters avoids oversized requests while still making JSON translation fast.
+MAX_BATCH_STRINGS = 100
+MAX_BATCH_CHARACTERS = 25_000
+REQUEST_TIMEOUT_SECONDS = 30.0
 
-# CPU-friendly inference settings. Smaller batches reduce peak RAM usage, while
-# two beams provide a reasonable translation quality/speed compromise.
-BATCH_SIZE = 8
-NUM_BEAMS = 2
-MAX_OUTPUT_LENGTH = 512
-# Simple in-memory cache: (text, source, target) -> translation.
-# Countries/static data barely change, so this avoids re-translating
-# the same strings on every request. Swap for Redis if you need it
-# to survive restarts or be shared across processes.
-_translation_cache: dict[tuple[str, str, str], str] = {}
+_translation_cache: dict[tuple[str, str | None, str], str] = {}
 
 
-detector = LanguageDetectorBuilder.from_languages(
-    Language.ENGLISH,
-    Language.FRENCH,
-    Language.ARABIC,
-    Language.JAPANESE,
-    Language.GERMAN,
-    Language.SPANISH,
-    Language.CHINESE,
-).build()
+def _api_key() -> str:
+    key = os.getenv("GOOGLE_TRANSLATE_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "GOOGLE_TRANSLATE_API_KEY is missing. Add it to the .env file."
+        )
+    return key
 
 
-def detect_language(text: str) -> str:
-    language = detector.detect_language_of(text)
-
+def _language_code(language: str | None) -> str | None:
     if language is None:
-        return "English"
+        return None
 
-    return LINGUA_TO_NAME.get(language, "English")
+    value = language.strip()
+    if not value:
+        return None
+
+    # Continue accepting the old API's names, but also accept Google codes.
+    return LANGUAGES.get(value, LANGUAGES.get(value.title(), value))
 
 
 def _glossary_translation(
     text: str,
-    source: str,
+    source: str | None,
     target: str,
 ) -> str | None:
-    """Return a reviewed exact-match translation, if one is available."""
-
+    if source is None:
+        return None
     normalized = " ".join(text.casefold().split())
-    return GLOSSARY.get((source, target), {}).get(normalized)
+    source_name = source.title()
+    target_name = target.title()
+    return GLOSSARY.get((source_name, target_name), {}).get(normalized)
+
+
+def _google_translate_batch(
+    texts: list[str],
+    source: str | None,
+    target: str,
+) -> list[str]:
+    if not texts:
+        return []
+
+    payload: dict[str, Any] = {
+        "q": texts,
+        "target": _language_code(target),
+        "format": "text",
+        "model": "nmt",
+    }
+    source_code = _language_code(source)
+    if source_code:
+        payload["source"] = source_code
+
+    try:
+        response = httpx.post(
+            GOOGLE_TRANSLATE_URL,
+            params={"key": _api_key()},
+            json=payload,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        translations = response.json()["data"]["translations"]
+    except httpx.HTTPStatusError as exc:
+        try:
+            message = exc.response.json()["error"]["message"]
+        except (KeyError, TypeError, ValueError):
+            message = exc.response.text or str(exc)
+        raise RuntimeError(f"Google Translation API error: {message}") from exc
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Google Translation API request failed: {exc}") from exc
+
+    if len(translations) != len(texts):
+        raise RuntimeError("Google Translation API returned an unexpected result count")
+
+    return [item["translatedText"] for item in translations]
+
+
+def _translate_batch_uncached(
+    texts: list[str],
+    source: str | None,
+    target: str,
+) -> list[str]:
+    results: list[str | None] = [None] * len(texts)
+    api_texts: list[str] = []
+    api_indexes: list[int] = []
+
+    for index, text in enumerate(texts):
+        glossary_value = _glossary_translation(text, source, target)
+        if glossary_value is not None:
+            results[index] = glossary_value
+        else:
+            api_indexes.append(index)
+            api_texts.append(text)
+
+    for index, translated in zip(
+        api_indexes, _google_translate_batch(api_texts, source, target)
+    ):
+        results[index] = translated
+
+    return results  # type: ignore[return-value]
+
+
+def _chunks(items: list[tuple[int, str]]):
+    chunk: list[tuple[int, str]] = []
+    characters = 0
+
+    for item in items:
+        item_characters = len(item[1])
+        if chunk and (
+            len(chunk) >= MAX_BATCH_STRINGS
+            or characters + item_characters > MAX_BATCH_CHARACTERS
+        ):
+            yield chunk
+            chunk = []
+            characters = 0
+
+        chunk.append(item)
+        characters += item_characters
+
+    if chunk:
+        yield chunk
+
+
+def translate_texts_batch(
+    texts: list[str],
+    source: str | None,
+    target: str,
+) -> list[str]:
+    if source and _language_code(source) == _language_code(target):
+        return texts
+
+    results: list[str | None] = [None] * len(texts)
+    misses: list[tuple[int, str]] = []
+
+    for index, text in enumerate(texts):
+        cache_key = (text, source, target)
+        cached = _translation_cache.get(cache_key)
+        if cached is None:
+            misses.append((index, text))
+        else:
+            results[index] = cached
+
+    for chunk in _chunks(misses):
+        chunk_texts = [text for _, text in chunk]
+        translated = _translate_batch_uncached(chunk_texts, source, target)
+
+        for (index, original), value in zip(chunk, translated):
+            results[index] = value
+            _translation_cache[(original, source, target)] = value
+
+    return results  # type: ignore[return-value]
 
 
 def translate_text(
@@ -107,141 +194,9 @@ def translate_text(
     target: str,
     source: str | None = None,
 ) -> str:
-    """Single-string translation. Kept for the /translate endpoint."""
-
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not text.strip():
         return text
-
-    if not text.strip():
-        return text
-
-    if source is None:
-        source = detect_language(text)
-
-    if source == target:
-        return text
-
-    return _translate_batch_uncached([text], source, target)[0]
-
-
-def _translate_batch_uncached(
-    texts: list[str],
-    source: str,
-    target: str,
-) -> list[str]:
-    """Runs a single batched forward pass through the model."""
-
-    if not texts:
-        return []
-
-    results: list[str | None] = [None] * len(texts)
-    model_texts: list[str] = []
-    model_indexes: list[int] = []
-
-    for index, text in enumerate(texts):
-        glossary_value = _glossary_translation(text, source, target)
-        if glossary_value is not None:
-            results[index] = glossary_value
-        else:
-            model_indexes.append(index)
-            model_texts.append(text)
-
-    if not model_texts:
-        return results  # type: ignore[return-value]
-
-    model, tokenizer, device = get_translation_model()
-
-
-    tokenizer.src_lang = LANGUAGES[source]
-
-
-    inputs = tokenizer(
-        model_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=512,
-    )
-
-
-    inputs = {
-        k: v.to(device)
-        for k, v in inputs.items()
-    }
-
-
-    with torch.no_grad():
-
-        outputs = model.generate(
-            **inputs,
-            forced_bos_token_id=tokenizer.convert_tokens_to_ids(
-                LANGUAGES[target]
-            ),
-            num_beams=NUM_BEAMS,
-            do_sample=False,
-            max_length=MAX_OUTPUT_LENGTH,
-            early_stopping=True,
-        )
-
-    model_translations = tokenizer.batch_decode(
-        outputs,
-        skip_special_tokens=True
-    )
-
-    for index, translation in zip(model_indexes, model_translations):
-        results[index] = translation
-
-    return results  # type: ignore[return-value]
-
-
-def translate_texts_batch(
-    texts: list[str],
-    source: str,
-    target: str,
-) -> list[str]:
-    """
-    Translates a list of strings, using the cache where possible and
-    only running the model on cache misses, chunked to BATCH_SIZE.
-    """
-
-    if source == target:
-        return texts
-
-    results: list[str | None] = [None] * len(texts)
-    misses: list[tuple[int, str]] = []
-
-    for i, text in enumerate(texts):
-        cached = _translation_cache.get((text, source, target))
-        if cached is not None:
-            results[i] = cached
-        else:
-            misses.append((i, text))
-
-    for start in range(0, len(misses), BATCH_SIZE):
-        chunk = misses[start : start + BATCH_SIZE]
-        chunk_texts = [t for _, t in chunk]
-
-        translated = _translate_batch_uncached(chunk_texts, source, target)
-
-        for (i, original_text), translation in zip(chunk, translated):
-            results[i] = translation
-            _translation_cache[(original_text, source, target)] = translation
-
-    return results  # type: ignore[return-value]
-
-
-def _collect_strings(obj: Any, strings: list[str]):
-    if isinstance(obj, dict):
-        for value in obj.values():
-            _collect_strings(value, strings)
-
-    elif isinstance(obj, list):
-        for item in obj:
-            _collect_strings(item, strings)
-
-    elif isinstance(obj, str):
-        if obj.strip():
-            strings.append(obj)
+    return translate_texts_batch([text], source, target)[0]
 
 
 def _collect_paths(
@@ -251,29 +206,22 @@ def _collect_paths(
     strings: list[str],
     ignore_keys: set[str],
 ):
-    """Walks the structure, recording a path + string for every
-    translatable leaf so we can batch-translate then reassemble."""
-
     if isinstance(obj, dict):
         for key, value in obj.items():
-            if key in ignore_keys:
-                continue
-            _collect_paths(value, path + [key], paths, strings, ignore_keys)
-
+            if key not in ignore_keys:
+                _collect_paths(value, path + [key], paths, strings, ignore_keys)
     elif isinstance(obj, list):
-        for i, item in enumerate(obj):
-            _collect_paths(item, path + [i], paths, strings, ignore_keys)
-
-    elif isinstance(obj, str):
-        if obj.strip():
-            paths.append(path)
-            strings.append(obj)
+        for index, item in enumerate(obj):
+            _collect_paths(item, path + [index], paths, strings, ignore_keys)
+    elif isinstance(obj, str) and obj.strip():
+        paths.append(path)
+        strings.append(obj)
 
 
 def _set_path(obj: Any, path: list, value: Any):
     target = obj
-    for p in path[:-1]:
-        target = target[p]
+    for part in path[:-1]:
+        target = target[part]
     target[path[-1]] = value
 
 
@@ -283,22 +231,7 @@ def translate_json_values(
     ignore_keys: set[str],
     source: str | None = None,
 ):
-    """
-    Translate only JSON string values, in a single batched model call
-    per request (instead of one call per string).
-
-    Keys and ignored keys remain unchanged.
-    If source is None, it's detected once from a sample of the strings.
-    """
-
-    if source is None:
-        sample_strings: list[str] = []
-        _collect_strings(obj, sample_strings)
-        sample = " ".join(sample_strings[:10])
-        source = detect_language(sample) if sample.strip() else "English"
-
     result = copy.deepcopy(obj)
-
     paths: list[list] = []
     strings: list[str] = []
     _collect_paths(result, [], paths, strings, ignore_keys)
@@ -306,9 +239,12 @@ def translate_json_values(
     if not strings:
         return result
 
+    # When source is omitted Google detects it per string automatically.
     translated = translate_texts_batch(strings, source, target)
-
     for path, value in zip(paths, translated):
-        _set_path(result, path, value)
+        if path:
+            _set_path(result, path, value)
+        else:
+            result = value
 
     return result

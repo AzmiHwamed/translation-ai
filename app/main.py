@@ -11,7 +11,7 @@ logging.basicConfig(
 
 
 app = FastAPI(
-    title="Offline Translation Service"
+    title="Google Cloud Translation Service"
 )
 
 
@@ -24,5 +24,6 @@ app.include_router(
 @app.get("/")
 def home():
     return {
-        "status": "translation running"
+        "status": "translation running",
+        "provider": "Google Cloud Translation NMT",
     }
