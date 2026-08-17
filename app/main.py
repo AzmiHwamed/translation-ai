@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 import logging
 
-from app.routers import translation
+from app.routers import speech, translation
 
 
 logging.basicConfig(
@@ -19,6 +19,8 @@ app.include_router(
     translation.router,
     prefix="/ai"
 )
+
+app.include_router(speech.router, prefix="/ai")
 
 
 @app.get("/")
